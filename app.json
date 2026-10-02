@@ -27,6 +27,7 @@
           "faceIDPermission": "Permitir que o Aplicativo Alfa use o Face ID para confirmar sua identidade."
         }
       ],
+      "expo-notifications",
       "expo-font"
     ],
     "ios": {

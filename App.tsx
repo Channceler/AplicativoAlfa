@@ -4,6 +4,13 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as LocalAuthentication from 'expo-local-authentication';
 import * as Location from 'expo-location';
+import { setNotificationHandler } from 'expo-notifications/build/NotificationsHandler';
+import { requestPermissionsAsync } from 'expo-notifications/build/NotificationPermissions';
+import { AndroidImportance } from 'expo-notifications/build/NotificationChannelManager.types';
+import { setNotificationChannelAsync } from 'expo-notifications/build/setNotificationChannelAsync';
+import { cancelScheduledNotificationAsync } from 'expo-notifications/build/cancelScheduledNotificationAsync';
+import { scheduleNotificationAsync } from 'expo-notifications/build/scheduleNotificationAsync';
+import { SchedulableTriggerInputTypes } from 'expo-notifications/build/Notifications.types';
 import { StatusBar } from 'expo-status-bar';
 import { WebView } from 'react-native-webview';
 import { useEffect, useRef, useState } from 'react';
@@ -18,25 +25,59 @@ import {
   SafeAreaView,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
   useWindowDimensions,
 } from 'react-native';
 
-type TabId = 'todo' | 'biometrics' | 'map' | 'camera' | 'storage';
-type AuthScreen = 'login' | 'signup' | 'biometric' | 'app';
-type TodoItem = { id: string; title: string; done: boolean; createdAt?: string };
+type TabId = 'todo' | 'security' | 'map' | 'camera' | 'storage';
+type OrganizerSection = 'today' | 'tasks' | 'habits' | 'notes';
+type TaskPriority = 'Baixa' | 'Média' | 'Alta';
+type AuthScreen = 'login' | 'signup' | 'app';
+type TodoItem = {
+  id: string;
+  title: string;
+  done: boolean;
+  createdAt?: string;
+  category?: string;
+  priority?: TaskPriority;
+  dueDate?: string;
+  reminderTime?: string;
+  notificationId?: string;
+};
+type HabitItem = { id: string; title: string; createdAt: string; completedDates: string[] };
+type NoteItem = { id: string; title: string; body: string; updatedAt: string };
 type StoredItem = { key: string; value: string };
-type SavedPhoto = { id: string; uri: string; savedAt: string };
+type SavedPhoto = { id: string; uri: string; savedAt: string; taskId?: string };
 type SavedPosition = { id: string; latitude: number; longitude: number; accuracy: number | null; savedAt: string };
 
 const TASKS_KEY = '@aplicativo-alfa/tasks/v1';
 const PHOTOS_KEY = '@aplicativo-alfa/photos/v1';
 const BIOMETRICS_KEY = '@aplicativo-alfa/biometrics/v1';
 const POSITIONS_KEY = '@aplicativo-alfa/positions/v1';
+const HABITS_KEY = '@aplicativo-alfa/habits/v1';
+const NOTES_KEY = '@aplicativo-alfa/notes/v1';
 const APP_STORAGE_PREFIX = '@aplicativo-alfa/';
 const MAX_SAVED_POSITIONS = 50;
+const TASK_CATEGORIES = ['Pessoal', 'Trabalho', 'Casa', 'Saúde'];
+const TASK_PRIORITIES: TaskPriority[] = ['Baixa', 'Média', 'Alta'];
+const ORGANIZER_SECTIONS: { id: OrganizerSection; label: string; icon: keyof typeof Ionicons.glyphMap }[] = [
+  { id: 'today', label: 'Meu dia', icon: 'sunny-outline' },
+  { id: 'tasks', label: 'Tarefas', icon: 'checkbox-outline' },
+  { id: 'habits', label: 'Hábitos', icon: 'repeat-outline' },
+  { id: 'notes', label: 'Notas', icon: 'document-text-outline' },
+];
+
+setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+  }),
+});
 
 function parseSavedPhotos(value: string | null): SavedPhoto[] {
   if (!value) return [];
@@ -87,6 +128,87 @@ function formatCoordinates(value: number) {
   return value.toFixed(6);
 }
 
+function localDateKey(date = new Date()) {
+  const year = date.getFullYear();
+  const month = `${date.getMonth() + 1}`.padStart(2, '0');
+  const day = `${date.getDate()}`.padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function parseLocalDate(value: string): Date | null {
+  const match = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(value.trim());
+  if (!match) return null;
+  const [, day, month, year] = match;
+  const date = new Date(Number(year), Number(month) - 1, Number(day));
+  if (date.getFullYear() !== Number(year) || date.getMonth() !== Number(month) - 1 || date.getDate() !== Number(day)) return null;
+  return date;
+}
+
+function formatLocalDate(value: string | undefined) {
+  if (!value) return '';
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  return match ? `${match[3]}/${match[2]}/${match[1]}` : '';
+}
+
+function parseHabitItems(value: string | null): HabitItem[] {
+  if (!value) return [];
+  const parsed: unknown = JSON.parse(value);
+  if (
+    !Array.isArray(parsed) ||
+    parsed.some((habit) =>
+      typeof habit !== 'object' ||
+      habit === null ||
+      !('id' in habit) ||
+      typeof habit.id !== 'string' ||
+      !('title' in habit) ||
+      typeof habit.title !== 'string' ||
+      !('createdAt' in habit) ||
+      typeof habit.createdAt !== 'string' ||
+      !('completedDates' in habit) ||
+      !Array.isArray(habit.completedDates) ||
+      habit.completedDates.some((date: unknown) => typeof date !== 'string'),
+    )
+  ) {
+    throw new Error('Formato inválido na lista de hábitos.');
+  }
+  return parsed;
+}
+
+function parseNoteItems(value: string | null): NoteItem[] {
+  if (!value) return [];
+  const parsed: unknown = JSON.parse(value);
+  if (
+    !Array.isArray(parsed) ||
+    parsed.some((note) =>
+      typeof note !== 'object' ||
+      note === null ||
+      !('id' in note) ||
+      typeof note.id !== 'string' ||
+      !('title' in note) ||
+      typeof note.title !== 'string' ||
+      !('body' in note) ||
+      typeof note.body !== 'string' ||
+      !('updatedAt' in note) ||
+      typeof note.updatedAt !== 'string',
+    )
+  ) {
+    throw new Error('Formato inválido na lista de notas.');
+  }
+  return parsed;
+}
+
+function habitStreak(completedDates: string[], today: string) {
+  const completed = new Set(completedDates);
+  const cursor = new Date(`${today}T12:00:00`);
+  if (!completed.has(today)) cursor.setDate(cursor.getDate() - 1);
+  let streak = 0;
+  while (completed.has(localDateKey(cursor))) {
+    streak += 1;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+  return streak;
+}
+
 function parseSavedPositions(value: string | null): SavedPosition[] {
   if (!value) return [];
   const parsed: unknown = JSON.parse(value);
@@ -113,16 +235,16 @@ function parseSavedPositions(value: string | null): SavedPosition[] {
 }
 
 const tabs: { id: TabId; label: string; icon: keyof typeof Ionicons.glyphMap }[] = [
-  { id: 'todo', label: 'Tarefas', icon: 'checkbox-outline' },
-  { id: 'biometrics', label: 'Biometria', icon: 'finger-print-outline' },
+  { id: 'todo', label: 'Organizar', icon: 'calendar-outline' },
+  { id: 'security', label: 'Segurança', icon: 'shield-checkmark-outline' },
   { id: 'map', label: 'Mapa', icon: 'map-outline' },
   { id: 'camera', label: 'Câmera', icon: 'camera-outline' },
   { id: 'storage', label: 'Dados', icon: 'server-outline' },
 ];
 
 const screenCopy: Record<TabId, { eyebrow: string; title: string; subtitle: string }> = {
-  todo: { eyebrow: 'ESPAÇO PESSOAL', title: 'Um passo de cada vez.', subtitle: 'Sua lista fica guardada neste aparelho.' },
-  biometrics: { eyebrow: 'ACESSO SEGURO', title: 'Só você pode entrar.', subtitle: 'Confirme sua identidade com a segurança do aparelho.' },
+  todo: { eyebrow: 'ESPAÇO PESSOAL', title: 'Organize seu dia.', subtitle: 'Tarefas, hábitos e ideias em um só lugar.' },
+  security: { eyebrow: 'CONFIGURAÇÕES', title: 'Sua segurança.', subtitle: 'Gerencie o cadastro biométrico do aparelho.' },
   map: { eyebrow: 'AO SEU REDOR', title: 'Você está aqui.', subtitle: 'Veja sua posição atual no mapa.' },
   camera: { eyebrow: 'CAPTURA RÁPIDA', title: 'Guarde o momento.', subtitle: 'Use a câmera do aparelho para tirar uma foto.' },
   storage: { eyebrow: 'ARMAZENAMENTO LOCAL', title: 'Seus dados, à vista.', subtitle: 'Consulte os dados salvos por este app no aparelho.' },
@@ -138,10 +260,26 @@ export default function App() {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [authMessage, setAuthMessage] = useState('');
   const [activeTab, setActiveTab] = useState<TabId>('todo');
+  const [organizerSection, setOrganizerSection] = useState<OrganizerSection>('today');
   const [tasks, setTasks] = useState<TodoItem[]>([]);
   const [tasksReady, setTasksReady] = useState(false);
   const [newTask, setNewTask] = useState('');
-  const [bioState, setBioState] = useState<'checking' | 'ready' | 'missing' | 'success' | 'failed'>('checking');
+  const [taskCategory, setTaskCategory] = useState(TASK_CATEGORIES[0]);
+  const [taskPriority, setTaskPriority] = useState<TaskPriority>('Média');
+  const [taskDueDate, setTaskDueDate] = useState('');
+  const [taskReminderTime, setTaskReminderTime] = useState('09:00');
+  const [taskReminderEnabled, setTaskReminderEnabled] = useState(false);
+  const [taskMessage, setTaskMessage] = useState('');
+  const [habits, setHabits] = useState<HabitItem[]>([]);
+  const [newHabit, setNewHabit] = useState('');
+  const [notes, setNotes] = useState<NoteItem[]>([]);
+  const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
+  const [newNoteTitle, setNewNoteTitle] = useState('');
+  const [newNoteBody, setNewNoteBody] = useState('');
+  const [bioState, setBioState] = useState<'checking' | 'ready' | 'missing'>('checking');
+  const [bioEnabled, setBioEnabled] = useState(false);
+  const [bioBusy, setBioBusy] = useState(false);
+  const [bioMessage, setBioMessage] = useState('');
   const [location, setLocation] = useState<Location.LocationObject | null>(null);
   const [locationBusy, setLocationBusy] = useState(false);
   const [locationMessage, setLocationMessage] = useState('');
@@ -149,6 +287,8 @@ export default function App() {
   const [mapLoadMessage, setMapLoadMessage] = useState('');
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [photoUri, setPhotoUri] = useState<string | null>(null);
+  const [photoTaskId, setPhotoTaskId] = useState('');
+  const [selectedPhotoTaskId, setSelectedPhotoTaskId] = useState('');
   const [cameraBusy, setCameraBusy] = useState(false);
   const [savedPhotos, setSavedPhotos] = useState<SavedPhoto[]>([]);
   const [savedPositions, setSavedPositions] = useState<SavedPosition[]>([]);
@@ -156,14 +296,24 @@ export default function App() {
   const [storageBusy, setStorageBusy] = useState(false);
   const cameraRef = useRef<CameraView>(null);
   const skipNextTaskSave = useRef(false);
+  const skipNextHabitsSave = useRef(false);
+  const skipNextNotesSave = useRef(false);
   const { width: screenWidth } = useWindowDimensions();
   const isCompactScreen = screenWidth < 360;
 
   useEffect(() => {
     let mounted = true;
-    AsyncStorage.getItem(TASKS_KEY)
-      .then((value) => { if (mounted && value) setTasks(JSON.parse(value) as TodoItem[]); })
-      .catch(() => Alert.alert('Não foi possível carregar as tarefas', 'Tente abrir a lista novamente.'))
+    AsyncStorage.multiGet([TASKS_KEY, HABITS_KEY, NOTES_KEY, PHOTOS_KEY])
+      .then((pairs) => {
+        if (!mounted) return;
+        const valueFor = (key: string) => pairs.find(([storedKey]) => storedKey === key)?.[1] ?? null;
+        const taskValue = valueFor(TASKS_KEY);
+        if (taskValue) setTasks(JSON.parse(taskValue) as TodoItem[]);
+        setHabits(parseHabitItems(valueFor(HABITS_KEY)));
+        setNotes(parseNoteItems(valueFor(NOTES_KEY)));
+        setSavedPhotos(parseSavedPhotos(valueFor(PHOTOS_KEY)));
+      })
+      .catch(() => Alert.alert('Não foi possível carregar os dados locais', 'Tente abrir novamente o organizador do app.'))
       .finally(() => { if (mounted) setTasksReady(true); });
     return () => { mounted = false; };
   }, []);
@@ -181,12 +331,47 @@ export default function App() {
   }, [tasks, tasksReady]);
 
   useEffect(() => {
-    if (activeTab !== 'biometrics') return;
+    if (tasksReady) {
+      if (skipNextHabitsSave.current) {
+        skipNextHabitsSave.current = false;
+        return;
+      }
+      AsyncStorage.setItem(HABITS_KEY, JSON.stringify(habits)).catch(() =>
+        Alert.alert('Não foi possível salvar os hábitos', 'Confira o armazenamento do aparelho e tente novamente.'),
+      );
+    }
+  }, [habits, tasksReady]);
+
+  useEffect(() => {
+    if (tasksReady) {
+      if (skipNextNotesSave.current) {
+        skipNextNotesSave.current = false;
+        return;
+      }
+      AsyncStorage.setItem(NOTES_KEY, JSON.stringify(notes)).catch(() =>
+        Alert.alert('Não foi possível salvar as notas', 'Confira o armazenamento do aparelho e tente novamente.'),
+      );
+    }
+  }, [notes, tasksReady]);
+
+  useEffect(() => {
+    if (activeTab !== 'security') return;
     let mounted = true;
-    setBioState('checking');
-    Promise.all([LocalAuthentication.hasHardwareAsync(), LocalAuthentication.isEnrolledAsync()])
-      .then(([hasHardware, isEnrolled]) => { if (mounted) setBioState(hasHardware && isEnrolled ? 'ready' : 'missing'); })
-      .catch(() => { if (mounted) setBioState('missing'); });
+    Promise.all([
+      LocalAuthentication.hasHardwareAsync(),
+      LocalAuthentication.isEnrolledAsync(),
+      AsyncStorage.getItem(BIOMETRICS_KEY),
+    ])
+      .then(([hasHardware, isEnrolled, registration]) => {
+        if (!mounted) return;
+        setBioState(hasHardware && isEnrolled ? 'ready' : 'missing');
+        setBioEnabled(Boolean(registration && parseBiometricDate(registration)));
+      })
+      .catch(() => {
+        if (!mounted) return;
+        setBioState('missing');
+        Alert.alert('Falha ao consultar biometria', 'Não foi possível verificar a biometria ou ler seu cadastro local.');
+      });
     return () => { mounted = false; };
   }, [activeTab]);
 
@@ -196,9 +381,153 @@ export default function App() {
 
   async function addTask() {
     const title = newTask.trim();
-    if (!title) return;
-    setTasks((current) => [{ id: `${Date.now()}`, title, done: false, createdAt: new Date().toISOString() }, ...current]);
+    if (!title) {
+      setTaskMessage('Digite um título para a tarefa.');
+      return;
+    }
+
+    const dueDate = taskDueDate.trim() ? parseLocalDate(taskDueDate) : null;
+    if (taskDueDate.trim() && !dueDate) {
+      setTaskMessage('Informe um prazo válido no formato DD/MM/AAAA.');
+      return;
+    }
+
+    const id = `${Date.now()}`;
+    let notificationId: string | undefined;
+    if (taskReminderEnabled) {
+      if (!dueDate) {
+        setTaskMessage('Informe o prazo da tarefa para programar um lembrete.');
+        return;
+      }
+      const timeMatch = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(taskReminderTime.trim());
+      if (!timeMatch) {
+        setTaskMessage('Informe um horário válido no formato HH:MM.');
+        return;
+      }
+      dueDate.setHours(Number(timeMatch[1]), Number(timeMatch[2]), 0, 0);
+      if (dueDate.getTime() <= Date.now()) {
+        setTaskMessage('O horário do lembrete precisa estar no futuro.');
+        return;
+      }
+      try {
+        if (Platform.OS === 'android') {
+          await setNotificationChannelAsync('task-reminders', {
+            name: 'Lembretes de tarefas',
+            importance: AndroidImportance.DEFAULT,
+          });
+        }
+        const { status } = await requestPermissionsAsync();
+        if (status !== 'granted') {
+          setTaskMessage('Permita notificações nas configurações do aparelho para criar este lembrete.');
+          return;
+        }
+        notificationId = await scheduleNotificationAsync({
+          content: { title: 'Lembrete de tarefa', body: title, data: { taskId: id } },
+          trigger: { type: SchedulableTriggerInputTypes.DATE, date: dueDate },
+        });
+      } catch {
+        setTaskMessage('Não foi possível programar o lembrete. Verifique as permissões e tente novamente.');
+        return;
+      }
+    }
+
+    const task: TodoItem = {
+      id,
+      title,
+      done: false,
+      createdAt: new Date().toISOString(),
+      category: taskCategory,
+      priority: taskPriority,
+      dueDate: dueDate ? localDateKey(dueDate) : undefined,
+      reminderTime: taskReminderEnabled ? taskReminderTime.trim() : undefined,
+      notificationId,
+    };
+    setTasks((current) => [task, ...current]);
     setNewTask('');
+    setTaskDueDate('');
+    setTaskReminderEnabled(false);
+    setTaskMessage('');
+  }
+
+  async function toggleTask(task: TodoItem) {
+    const done = !task.done;
+    try {
+      let notificationId = task.notificationId;
+      if (done && notificationId) {
+        await cancelScheduledNotificationAsync(notificationId);
+        notificationId = undefined;
+      } else if (!done && task.reminderTime && task.dueDate) {
+        const dueDate = new Date(`${task.dueDate}T${task.reminderTime}:00`);
+        if (dueDate.getTime() > Date.now()) {
+          notificationId = await scheduleNotificationAsync({
+            content: { title: 'Lembrete de tarefa', body: task.title, data: { taskId: task.id } },
+            trigger: { type: SchedulableTriggerInputTypes.DATE, date: dueDate },
+          });
+        }
+      }
+      setTasks((current) => current.map((item) => item.id === task.id ? { ...item, done, notificationId } : item));
+    } catch {
+      Alert.alert('Não foi possível atualizar a tarefa', 'A tarefa não foi alterada porque o lembrete não pôde ser atualizado.');
+    }
+  }
+
+  async function deleteTask(task: TodoItem) {
+    try {
+      if (task.notificationId) await cancelScheduledNotificationAsync(task.notificationId);
+      const updatedPhotos = savedPhotos.map((photo) => photo.taskId === task.id ? { ...photo, taskId: undefined } : photo);
+      if (updatedPhotos.some((photo, index) => photo.taskId !== savedPhotos[index]?.taskId)) {
+        await AsyncStorage.setItem(PHOTOS_KEY, JSON.stringify(updatedPhotos));
+        setSavedPhotos(updatedPhotos);
+      }
+      setTasks((current) => current.filter((item) => item.id !== task.id));
+    } catch {
+      Alert.alert('Não foi possível excluir a tarefa', 'O lembrete ainda está ativo. Tente novamente.');
+    }
+  }
+
+  function addHabit() {
+    const title = newHabit.trim();
+    if (!title) return;
+    setHabits((current) => [...current, { id: `${Date.now()}`, title, createdAt: new Date().toISOString(), completedDates: [] }]);
+    setNewHabit('');
+  }
+
+  function toggleHabitToday(habit: HabitItem) {
+    const today = localDateKey();
+    setHabits((current) => current.map((item) => item.id !== habit.id ? item : {
+      ...item,
+      completedDates: item.completedDates.includes(today)
+        ? item.completedDates.filter((date) => date !== today)
+        : [...item.completedDates, today],
+    }));
+  }
+
+  function addNote() {
+    const title = newNoteTitle.trim();
+    const body = newNoteBody.trim();
+    if (!title && !body) return;
+    if (editingNoteId) {
+      setNotes((current) => current.map((note) => note.id === editingNoteId
+        ? { ...note, title: title || 'Nota rápida', body, updatedAt: new Date().toISOString() }
+        : note));
+      setEditingNoteId(null);
+    } else {
+      setNotes((current) => [{ id: `${Date.now()}`, title: title || 'Nota rápida', body, updatedAt: new Date().toISOString() }, ...current]);
+    }
+    setNewNoteTitle('');
+    setNewNoteBody('');
+  }
+
+  function editNote(note: NoteItem) {
+    setEditingNoteId(note.id);
+    setNewNoteTitle(note.title);
+    setNewNoteBody(note.body);
+  }
+
+  function cancelNoteEdit() {
+    setEditingNoteId(null);
+    setNewNoteTitle('');
+    setNewNoteBody('');
   }
 
   async function refreshStorage() {
@@ -218,8 +547,12 @@ export default function App() {
 
   async function clearStorage() {
     const keys = storedItems.map(({ key }) => key);
-    if (!keys.length) return;
+    if (!keys.length && !tasks.length) return;
     try {
+      const reminderIds = tasks.flatMap((task) => task.notificationId ? [task.notificationId] : []);
+      const cancelledReminders = await Promise.allSettled(
+        reminderIds.map((notificationId) => cancelScheduledNotificationAsync(notificationId)),
+      );
       const documentDirectory = FileSystem.documentDirectory;
       if (!documentDirectory) throw new Error('O armazenamento permanente não está disponível.');
       const photosDirectory = `${documentDirectory}aplicativo-alfa/photos/`;
@@ -227,28 +560,48 @@ export default function App() {
       if (directoryInfo.exists) await FileSystem.deleteAsync(photosDirectory, { idempotent: true });
       await AsyncStorage.multiRemove(keys);
       skipNextTaskSave.current = true;
+      skipNextHabitsSave.current = true;
+      skipNextNotesSave.current = true;
       setTasks([]);
+      setHabits([]);
+      setNotes([]);
       setSavedPhotos([]);
       setSavedPositions([]);
       setPhotoUri(null);
+      setPhotoTaskId('');
+      setBioEnabled(false);
+      setBioMessage('');
       await refreshStorage();
+      if (cancelledReminders.some((result) => result.status === 'rejected')) {
+        Alert.alert('Dados limpos', 'Os dados foram removidos, mas um ou mais lembretes não puderam ser cancelados.');
+      }
     } catch {
       Alert.alert('Falha ao limpar dados', 'Tente novamente.');
     }
   }
 
-  async function authenticate() {
+  async function setBiometricsEnabled(enabled: boolean) {
+    setBioBusy(true);
+    setBioMessage('');
     try {
-      const result = await LocalAuthentication.authenticateAsync({ promptMessage: 'Confirmar identidade' });
-      if (result.success) {
-        setBioState('success');
+      if (enabled) {
+        const result = await LocalAuthentication.authenticateAsync({ promptMessage: 'Confirmar cadastro biométrico' });
+        if (!result.success) {
+          setBioMessage('A confirmação foi cancelada. A biometria continua desativada.');
+          return;
+        }
         await saveBiometricRegistration();
       } else {
-        setBioState('failed');
+        await AsyncStorage.removeItem(BIOMETRICS_KEY);
       }
+      setBioEnabled(enabled);
     } catch {
-      setBioState('failed');
-      Alert.alert('Biometria não salva', 'A verificação não foi concluída ou não foi possível salvar o registro biométrico.');
+      Alert.alert(
+        enabled ? 'Biometria não ativada' : 'Biometria não removida',
+        'Não foi possível atualizar o cadastro biométrico. Tente novamente.',
+      );
+    } finally {
+      setBioBusy(false);
     }
   }
 
@@ -353,9 +706,15 @@ export default function App() {
       destinationUri = `${photosDirectory}${id}.jpg`;
       await FileSystem.copyAsync({ from: photo.uri, to: destinationUri });
       const existingPhotos = parseSavedPhotos(await AsyncStorage.getItem(PHOTOS_KEY));
-      const savedPhoto: SavedPhoto = { id, uri: destinationUri, savedAt: new Date().toISOString() };
+      const savedPhoto: SavedPhoto = {
+        id,
+        uri: destinationUri,
+        savedAt: new Date().toISOString(),
+        taskId: selectedPhotoTaskId || undefined,
+      };
       await AsyncStorage.setItem(PHOTOS_KEY, JSON.stringify([savedPhoto, ...existingPhotos]));
       setPhotoUri(destinationUri);
+      setPhotoTaskId(selectedPhotoTaskId);
       setSavedPhotos((current) => [savedPhoto, ...current]);
     } catch {
       let cleanupFailed = false;
@@ -400,41 +759,11 @@ export default function App() {
       return;
     }
     setAuthMessage('');
-    setAuthScreen('biometric');
-  }
-
-  async function registerBiometrics() {
-    try {
-      const [hasHardware, isEnrolled] = await Promise.all([
-        LocalAuthentication.hasHardwareAsync(),
-        LocalAuthentication.isEnrolledAsync(),
-      ]);
-      if (!hasHardware || !isEnrolled) {
-        setAuthMessage('Configure a biometria nas definições do aparelho e tente novamente.');
-        return;
-      }
-      const result = await LocalAuthentication.authenticateAsync({
-        promptMessage: 'Confirmar cadastro biométrico',
-      });
-      if (result.success) {
-        try {
-          await saveBiometricRegistration();
-          setAuthMessage('');
-          setAuthScreen('app');
-        } catch {
-          setAuthMessage('A biometria foi confirmada, mas não foi possível salvar o registro. Tente novamente.');
-        }
-      } else {
-        setAuthMessage('Não foi possível confirmar sua biometria. Tente novamente ou continue sem ela.');
-      }
-    } catch {
-      setAuthMessage('O cadastro biométrico não está disponível neste aparelho.');
-    }
+    setAuthScreen('app');
   }
 
   if (authScreen !== 'app') {
     const isSignup = authScreen === 'signup';
-    const isBiometric = authScreen === 'biometric';
 
     return (
       <SafeAreaView style={styles.safeArea}>
@@ -447,42 +776,15 @@ export default function App() {
             </View>
 
             <View style={[styles.authCard, isCompactScreen && styles.authCardCompact]}>
-              <Text style={styles.authEyebrow}>
-                {isBiometric ? 'ACESSO SEGURO' : isSignup ? 'NOVA CONTA' : 'SEJA BEM-VINDO'}
-              </Text>
-              <Text style={styles.authTitle}>
-                {isBiometric ? 'Cadastro de Biometria' : isSignup ? 'Cadastre-se' : 'Login'}
-              </Text>
+              <Text style={styles.authEyebrow}>{isSignup ? 'NOVA CONTA' : 'SEJA BEM-VINDO'}</Text>
+              <Text style={styles.authTitle}>{isSignup ? 'Cadastre-se' : 'Login'}</Text>
               <Text style={styles.authSubtitle}>
-                {isBiometric
-                  ? 'Use a segurança do seu aparelho para confirmar sua identidade.'
-                  : isSignup
-                    ? 'Crie sua conta para começar a usar o Aplicativo Alfa.'
-                    : 'Entre com seus dados para acessar o Aplicativo Alfa.'}
+                {isSignup
+                  ? 'Crie sua conta para começar a usar o Aplicativo Alfa.'
+                  : 'Entre com seus dados para acessar o Aplicativo Alfa.'}
               </Text>
 
-              {isBiometric ? (
-                <View style={styles.authForm}>
-                  <View style={styles.authBiometricIcon}>
-                    <Ionicons name="finger-print-outline" size={54} color={colors.green} />
-                  </View>
-                  <Text style={styles.authBiometricCopy}>
-                    A biometria é verificada pelo sistema do aparelho. O app não recebe nem armazena seus dados biométricos.
-                  </Text>
-                  <Pressable onPress={() => void registerBiometrics()} style={styles.authPrimaryButton} accessibilityRole="button">
-                    <Ionicons name="shield-checkmark-outline" size={19} color={colors.white} />
-                    <Text style={styles.authPrimaryText}>Cadastrar biometria</Text>
-                  </Pressable>
-                  <Pressable
-                    onPress={() => { setAuthMessage(''); setAuthScreen('app'); }}
-                    style={styles.authSecondaryButton}
-                    accessibilityRole="button"
-                  >
-                    <Text style={styles.authSecondaryText}>Continuar sem biometria</Text>
-                  </Pressable>
-                </View>
-              ) : (
-                <View style={styles.authForm}>
+              <View style={styles.authForm}>
                   {isSignup && (
                     <View style={styles.authField}>
                       <Text style={styles.authLabel}>Nome completo</Text>
@@ -572,8 +874,7 @@ export default function App() {
                       <Text style={styles.authLinkStrong}>{isSignup ? 'Fazer login' : 'Cadastre-se'}</Text>
                     </Text>
                   </Pressable>
-                </View>
-              )}
+              </View>
             </View>
             <Text style={styles.authFooter}>PROTÓTIPO · CONECTE UM SERVIÇO DE AUTENTICAÇÃO</Text>
           </ScrollView>
@@ -592,8 +893,59 @@ export default function App() {
     if (key === TASKS_KEY) return total + tasks.length;
     if (key === PHOTOS_KEY) return total + savedPhotos.length;
     if (key === POSITIONS_KEY) return total + savedPositions.length;
+    if (key === HABITS_KEY) return total + habits.length;
+    if (key === NOTES_KEY) return total + notes.length;
     return total + 1;
   }, 0);
+  const todayKey = localDateKey();
+  const todayTasks = tasks
+    .filter((task) => task.dueDate && task.dueDate <= todayKey)
+    .sort((first, second) => Number(first.done) - Number(second.done));
+  const todayOpenTasks = todayTasks.filter((task) => !task.done).length;
+  const habitsCompletedToday = habits.filter((habit) => habit.completedDates.includes(todayKey)).length;
+  const renderTask = (task: TodoItem) => (
+    <View key={task.id} style={styles.taskCard}>
+      <View style={styles.taskCardTop}>
+        <Pressable
+          onPress={() => void toggleTask(task)}
+          style={[styles.checkButton, task.done && styles.checkButtonDone]}
+          accessibilityRole="checkbox"
+          accessibilityState={{ checked: task.done }}
+          accessibilityLabel={`Marcar ${task.title} como ${task.done ? 'pendente' : 'concluída'}`}
+        >
+          {task.done && <Ionicons name="checkmark" size={16} color={colors.white} />}
+        </Pressable>
+        <Text style={[styles.taskTitle, task.done && styles.taskTitleDone]}>{task.title}</Text>
+        <Pressable onPress={() => void deleteTask(task)} style={styles.removeButton} accessibilityRole="button" accessibilityLabel={`Excluir ${task.title}`}>
+          <Ionicons name="close" size={20} color={colors.muted} />
+        </Pressable>
+      </View>
+      <View style={styles.taskMetaRow}>
+        <Text style={styles.categoryPill}>{task.category ?? 'Pessoal'}</Text>
+        <Text style={[styles.priorityPill, task.priority === 'Alta' && styles.priorityHigh, task.priority === 'Baixa' && styles.priorityLow]}>
+          {task.priority ?? 'Média'}
+        </Text>
+        {task.dueDate ? <Text style={styles.taskMetaText}>{task.dueDate < todayKey ? 'Atrasada · ' : 'Prazo · '}{formatLocalDate(task.dueDate)}</Text> : null}
+        {task.reminderTime ? <Text style={styles.taskMetaText}>Lembrete · {task.reminderTime}</Text> : null}
+      </View>
+      {savedPhotos.some((photo) => photo.taskId === task.id) ? (
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.taskPhotoStrip}>
+          {savedPhotos.filter((photo) => photo.taskId === task.id).map((photo) => (
+            <Image key={photo.id} source={{ uri: photo.uri }} style={styles.taskPhotoPreview} resizeMode="cover" accessibilityLabel={`Foto anexada à tarefa ${task.title}`} />
+          ))}
+        </ScrollView>
+      ) : null}
+      <Pressable
+        onPress={() => { setSelectedPhotoTaskId(task.id); setPhotoUri(null); setActiveTab('camera'); }}
+        style={styles.attachPhotoButton}
+        accessibilityRole="button"
+        accessibilityLabel={`Adicionar foto à tarefa ${task.title}`}
+      >
+        <Ionicons name="camera-outline" size={16} color={colors.green} />
+        <Text style={styles.attachPhotoText}>Adicionar foto</Text>
+      </Pressable>
+    </View>
+  );
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -614,43 +966,234 @@ export default function App() {
 
           {activeTab === 'todo' && (
             <View style={styles.contentBlock}>
-              <View style={styles.summaryRow}>
-                <View style={styles.summaryCopy}><Text style={styles.summaryLabel}>PROGRESSO DE HOJE</Text><Text style={styles.summaryTitle}>{completedTasks} de {tasks.length} concluídas</Text></View>
-                <View style={styles.progressRing}><Text style={styles.progressNumber}>{tasks.length ? Math.round((completedTasks / tasks.length) * 100) : 0}%</Text></View>
-              </View>
-              <View style={styles.progressTrack}><View style={[styles.progressFill, { width: `${tasks.length ? (completedTasks / tasks.length) * 100 : 0}%` }]} /></View>
-              <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-                <View style={styles.inputRow}>
-                  <TextInput value={newTask} onChangeText={setNewTask} onSubmitEditing={() => void addTask()} placeholder="Adicionar uma tarefa..." placeholderTextColor={colors.muted} returnKeyType="done" style={styles.taskInput} accessibilityLabel="Nova tarefa" />
-                  <Pressable onPress={() => void addTask()} style={styles.addButton} accessibilityRole="button" accessibilityLabel="Adicionar tarefa"><Ionicons name="add" size={24} color={colors.white} /></Pressable>
-                </View>
-              </KeyboardAvoidingView>
-              <View style={styles.listHeader}><Text style={styles.sectionTitle}>Sua lista</Text><Text style={styles.countLabel}>{tasks.length} ITENS</Text></View>
-              {!tasksReady ? <ActivityIndicator color={colors.green} style={styles.loader} /> : tasks.length === 0 ? (
-                <View style={styles.emptyState}><View style={styles.emptyIcon}><Ionicons name="leaf-outline" size={24} color={colors.green} /></View><Text style={styles.emptyTitle}>Tudo começa com uma tarefa.</Text><Text style={styles.emptyBody}>Adicione algo pequeno para começar.</Text></View>
-              ) : tasks.map((task) => (
-                <View key={task.id} style={styles.taskRow}>
-                  <Pressable onPress={() => setTasks((current) => current.map((item) => item.id === task.id ? { ...item, done: !item.done } : item))} style={[styles.checkButton, task.done && styles.checkButtonDone]} accessibilityRole="checkbox" accessibilityState={{ checked: task.done }} accessibilityLabel={`Marcar ${task.title} como ${task.done ? 'pendente' : 'concluída'}`}>
-                    {task.done && <Ionicons name="checkmark" size={16} color={colors.white} />}
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.organizerTabs}>
+                {ORGANIZER_SECTIONS.map((section) => {
+                  const selected = organizerSection === section.id;
+                  return (
+                    <Pressable
+                      key={section.id}
+                      onPress={() => setOrganizerSection(section.id)}
+                      style={[styles.organizerTab, selected && styles.organizerTabSelected]}
+                      accessibilityRole="tab"
+                      accessibilityState={{ selected }}
+                    >
+                      <Ionicons name={section.icon} size={16} color={selected ? colors.white : colors.green} />
+                      <Text style={[styles.organizerTabText, selected && styles.organizerTabTextSelected]}>{section.label}</Text>
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+
+              {organizerSection === 'today' && (
+                <View style={styles.contentBlock}>
+                  <View style={styles.daySummary}>
+                    <View style={styles.daySummaryHeader}>
+                      <View>
+                        <Text style={styles.summaryLabel}>RESUMO DE HOJE</Text>
+                        <Text style={styles.daySummaryTitle}>{todayOpenTasks} {todayOpenTasks === 1 ? 'tarefa pendente' : 'tarefas pendentes'}</Text>
+                      </View>
+                      <View style={styles.progressRing}><Text style={styles.progressNumber}>{habits.length ? `${Math.round((habitsCompletedToday / habits.length) * 100)}%` : '—'}</Text></View>
+                    </View>
+                    <View style={styles.progressTrack}><View style={[styles.progressFill, { width: `${habits.length ? (habitsCompletedToday / habits.length) * 100 : 0}%` }]} /></View>
+                    <Text style={styles.daySummaryDetail}>{habitsCompletedToday} de {habits.length} hábitos concluídos hoje</Text>
+                  </View>
+                  <View style={styles.listHeader}><Text style={styles.sectionTitle}>Tarefas com prazo</Text><Text style={styles.countLabel}>{todayTasks.length} ITENS</Text></View>
+                  {!tasksReady ? <ActivityIndicator color={colors.green} style={styles.loader} /> : todayTasks.length
+                    ? todayTasks.map(renderTask)
+                    : <View style={styles.emptyState}><View style={styles.emptyIcon}><Ionicons name="sunny-outline" size={24} color={colors.green} /></View><Text style={styles.emptyTitle}>Seu dia está livre.</Text><Text style={styles.emptyBody}>Adicione uma tarefa com prazo para vê-la neste resumo.</Text></View>}
+                  <Pressable onPress={() => setOrganizerSection('tasks')} style={styles.textAction} accessibilityRole="button">
+                    <Text style={styles.textActionLabel}>Ver todas as tarefas</Text><Ionicons name="arrow-forward" size={16} color={colors.green} />
                   </Pressable>
-                  <Text style={[styles.taskTitle, task.done && styles.taskTitleDone]}>{task.title}</Text>
-                  <Pressable onPress={() => setTasks((current) => current.filter((item) => item.id !== task.id))} style={styles.removeButton} accessibilityRole="button" accessibilityLabel={`Excluir ${task.title}`}><Ionicons name="close" size={20} color={colors.muted} /></Pressable>
+                  {habits.length ? (
+                    <View style={styles.todayHabits}>
+                      <View style={styles.listHeader}><Text style={styles.sectionTitle}>Hábitos de hoje</Text><Text style={styles.countLabel}>{habitsCompletedToday}/{habits.length}</Text></View>
+                      {habits.slice(0, 3).map((habit) => (
+                        <Pressable key={habit.id} onPress={() => toggleHabitToday(habit)} style={styles.habitCheckRow} accessibilityRole="checkbox" accessibilityState={{ checked: habit.completedDates.includes(todayKey) }}>
+                          <View style={[styles.checkButton, habit.completedDates.includes(todayKey) && styles.checkButtonDone]}>
+                            {habit.completedDates.includes(todayKey) && <Ionicons name="checkmark" size={16} color={colors.white} />}
+                          </View>
+                          <Text style={styles.habitCheckTitle}>{habit.title}</Text>
+                          <Text style={styles.streakLabel}>{habitStreak(habit.completedDates, todayKey)} dias</Text>
+                        </Pressable>
+                      ))}
+                    </View>
+                  ) : (
+                    <Pressable onPress={() => setOrganizerSection('habits')} style={styles.textAction} accessibilityRole="button">
+                      <Text style={styles.textActionLabel}>Criar seu primeiro hábito</Text><Ionicons name="arrow-forward" size={16} color={colors.green} />
+                    </Pressable>
+                  )}
                 </View>
-              ))}
+              )}
+
+              {organizerSection === 'tasks' && (
+                <View style={styles.contentBlock}>
+                  <View style={styles.summaryRow}>
+                    <View style={styles.summaryCopy}><Text style={styles.summaryLabel}>PROGRESSO GERAL</Text><Text style={styles.summaryTitle}>{completedTasks} de {tasks.length} concluídas</Text></View>
+                    <View style={styles.progressRing}><Text style={styles.progressNumber}>{tasks.length ? Math.round((completedTasks / tasks.length) * 100) : 0}%</Text></View>
+                  </View>
+                  <View style={styles.progressTrack}><View style={[styles.progressFill, { width: `${tasks.length ? (completedTasks / tasks.length) * 100 : 0}%` }]} /></View>
+                  <View style={styles.formCard}>
+                    <Text style={styles.formTitle}>Nova tarefa</Text>
+                    <TextInput value={newTask} onChangeText={(value) => { setNewTask(value); setTaskMessage(''); }} onSubmitEditing={() => void addTask()} placeholder="O que você precisa fazer?" placeholderTextColor={colors.muted} returnKeyType="done" style={styles.taskInput} accessibilityLabel="Nova tarefa" />
+                    <Text style={styles.fieldLabel}>CATEGORIA</Text>
+                    <View style={styles.choiceRow}>
+                      {TASK_CATEGORIES.map((category) => (
+                        <Pressable key={category} onPress={() => setTaskCategory(category)} style={[styles.choiceChip, taskCategory === category && styles.choiceChipSelected]} accessibilityRole="button" accessibilityState={{ selected: taskCategory === category }}>
+                          <Text style={[styles.choiceChipText, taskCategory === category && styles.choiceChipTextSelected]}>{category}</Text>
+                        </Pressable>
+                      ))}
+                    </View>
+                    <Text style={styles.fieldLabel}>PRIORIDADE</Text>
+                    <View style={styles.choiceRow}>
+                      {TASK_PRIORITIES.map((priority) => (
+                        <Pressable key={priority} onPress={() => setTaskPriority(priority)} style={[styles.choiceChip, taskPriority === priority && styles.choiceChipSelected]} accessibilityRole="button" accessibilityState={{ selected: taskPriority === priority }}>
+                          <Text style={[styles.choiceChipText, taskPriority === priority && styles.choiceChipTextSelected]}>{priority}</Text>
+                        </Pressable>
+                      ))}
+                    </View>
+                    <Text style={styles.fieldLabel}>PRAZO (OPCIONAL)</Text>
+                    <TextInput
+                      value={taskDueDate}
+                      onChangeText={(value) => { setTaskDueDate(value); setTaskMessage(''); }}
+                      placeholder="DD/MM/AAAA"
+                      placeholderTextColor={colors.muted}
+                      keyboardType="numbers-and-punctuation"
+                      maxLength={10}
+                      style={styles.taskInput}
+                      accessibilityLabel="Prazo no formato dia mês ano"
+                    />
+                    <View style={styles.reminderRow}>
+                      <View style={styles.reminderCopy}>
+                        <Text style={styles.reminderTitle}>Lembrete no aparelho</Text>
+                        <Text style={styles.reminderDescription}>Receba uma notificação no prazo escolhido.</Text>
+                      </View>
+                      <Switch
+                        value={taskReminderEnabled}
+                        onValueChange={(value) => { setTaskReminderEnabled(value); setTaskMessage(''); }}
+                        trackColor={{ false: colors.line, true: colors.mint }}
+                        thumbColor={taskReminderEnabled ? colors.green : colors.white}
+                        accessibilityLabel="Ativar lembrete para esta tarefa"
+                      />
+                    </View>
+                    {taskReminderEnabled ? (
+                      <>
+                      <Text style={styles.fieldLabel}>HORÁRIO DO LEMBRETE</Text>
+                      <TextInput
+                        value={taskReminderTime}
+                        onChangeText={(value) => { setTaskReminderTime(value); setTaskMessage(''); }}
+                        placeholder="HH:MM"
+                        placeholderTextColor={colors.muted}
+                        keyboardType="numbers-and-punctuation"
+                        maxLength={5}
+                        style={styles.taskInput}
+                        accessibilityLabel="Horário do lembrete"
+                      />
+                      </>
+                    ) : null}
+                    {taskMessage ? <Text style={styles.taskMessage} accessibilityRole="alert">{taskMessage}</Text> : null}
+                    <Pressable onPress={() => void addTask()} style={styles.primaryButton} accessibilityRole="button">
+                      <Ionicons name="add" size={19} color={colors.white} /><Text style={styles.primaryButtonText}>Adicionar tarefa</Text>
+                    </Pressable>
+                  </View>
+                  <View style={styles.listHeader}><Text style={styles.sectionTitle}>Sua lista</Text><Text style={styles.countLabel}>{tasks.length} ITENS</Text></View>
+                  {!tasksReady ? <ActivityIndicator color={colors.green} style={styles.loader} /> : tasks.length
+                    ? tasks.map(renderTask)
+                    : <View style={styles.emptyState}><View style={styles.emptyIcon}><Ionicons name="leaf-outline" size={24} color={colors.green} /></View><Text style={styles.emptyTitle}>Tudo começa com uma tarefa.</Text><Text style={styles.emptyBody}>Adicione algo pequeno para começar.</Text></View>}
+                </View>
+              )}
+
+              {organizerSection === 'habits' && (
+                <View style={styles.contentBlock}>
+                  <View style={styles.formCard}>
+                    <Text style={styles.formTitle}>Novo hábito diário</Text>
+                    <Text style={styles.emptyBody}>Escolha uma rotina pequena que queira acompanhar todos os dias.</Text>
+                    <View style={styles.inputRow}>
+                      <TextInput value={newHabit} onChangeText={setNewHabit} onSubmitEditing={addHabit} placeholder="Ex.: caminhar 20 minutos" placeholderTextColor={colors.muted} returnKeyType="done" style={styles.taskInput} accessibilityLabel="Nome do novo hábito" />
+                      <Pressable onPress={addHabit} style={styles.addButton} accessibilityRole="button" accessibilityLabel="Adicionar hábito"><Ionicons name="add" size={24} color={colors.white} /></Pressable>
+                    </View>
+                  </View>
+                  <View style={styles.listHeader}><Text style={styles.sectionTitle}>Sua rotina</Text><Text style={styles.countLabel}>{habitsCompletedToday}/{habits.length} HOJE</Text></View>
+                  {habits.length ? habits.map((habit) => {
+                    const doneToday = habit.completedDates.includes(todayKey);
+                    return (
+                      <View key={habit.id} style={styles.habitCard}>
+                        <Pressable onPress={() => toggleHabitToday(habit)} style={[styles.habitCheckButton, doneToday && styles.checkButtonDone]} accessibilityRole="checkbox" accessibilityState={{ checked: doneToday }} accessibilityLabel={`Marcar hábito ${habit.title} como ${doneToday ? 'pendente' : 'concluído'} hoje`}>
+                          {doneToday && <Ionicons name="checkmark" size={16} color={colors.white} />}
+                        </Pressable>
+                        <View style={styles.habitCopy}>
+                          <Text style={styles.habitTitle}>{habit.title}</Text>
+                          <Text style={styles.habitDetail}>{habitStreak(habit.completedDates, todayKey)} dias seguidos · {habit.completedDates.length} dias no total</Text>
+                        </View>
+                        <Pressable onPress={() => Alert.alert('Excluir hábito?', `O histórico de “${habit.title}” também será removido.`, [{ text: 'Cancelar', style: 'cancel' }, { text: 'Excluir', style: 'destructive', onPress: () => setHabits((current) => current.filter((item) => item.id !== habit.id)) }])} style={styles.removeButton} accessibilityRole="button" accessibilityLabel={`Excluir hábito ${habit.title}`}>
+                          <Ionicons name="close" size={20} color={colors.muted} />
+                        </Pressable>
+                      </View>
+                    );
+                  }) : <View style={styles.emptyState}><View style={styles.emptyIcon}><Ionicons name="repeat-outline" size={24} color={colors.green} /></View><Text style={styles.emptyTitle}>Uma rotina começa pequena.</Text><Text style={styles.emptyBody}>Adicione seu primeiro hábito diário e marque quando concluir.</Text></View>}
+                </View>
+              )}
+
+              {organizerSection === 'notes' && (
+                <View style={styles.contentBlock}>
+                  <View style={styles.formCard}>
+                    <Text style={styles.formTitle}>{editingNoteId ? 'Editar nota' : 'Anote uma ideia'}</Text>
+                    <TextInput value={newNoteTitle} onChangeText={setNewNoteTitle} placeholder="Título (opcional)" placeholderTextColor={colors.muted} style={styles.taskInput} accessibilityLabel="Título da nota" />
+                    <TextInput value={newNoteBody} onChangeText={setNewNoteBody} placeholder="Escreva uma nota ou lista rápida..." placeholderTextColor={colors.muted} multiline textAlignVertical="top" style={[styles.taskInput, styles.noteInput]} accessibilityLabel="Texto da nota" />
+                    <Pressable onPress={addNote} style={styles.primaryButton} accessibilityRole="button">
+                      <Ionicons name="save-outline" size={18} color={colors.white} /><Text style={styles.primaryButtonText}>{editingNoteId ? 'Salvar alterações' : 'Salvar nota'}</Text>
+                    </Pressable>
+                    {editingNoteId ? <Pressable onPress={cancelNoteEdit} style={styles.textAction} accessibilityRole="button"><Text style={styles.textActionLabel}>Cancelar edição</Text></Pressable> : null}
+                  </View>
+                  <View style={styles.listHeader}><Text style={styles.sectionTitle}>Notas salvas</Text><Text style={styles.countLabel}>{notes.length} ITENS</Text></View>
+                  {notes.length ? notes.map((note) => (
+                    <View key={note.id} style={styles.noteCard}>
+                      <View style={styles.noteHeader}>
+                        <View style={styles.noteTitleWrap}><Ionicons name="document-text-outline" size={18} color={colors.green} /><Text style={styles.noteTitle}>{note.title}</Text></View>
+                        <Pressable onPress={() => editNote(note)} style={styles.removeButton} accessibilityRole="button" accessibilityLabel={`Editar nota ${note.title}`}><Ionicons name="create-outline" size={17} color={colors.green} /></Pressable>
+                        <Pressable onPress={() => { setNotes((current) => current.filter((item) => item.id !== note.id)); if (editingNoteId === note.id) cancelNoteEdit(); }} style={styles.removeButton} accessibilityRole="button" accessibilityLabel={`Excluir nota ${note.title}`}><Ionicons name="trash-outline" size={17} color={colors.muted} /></Pressable>
+                      </View>
+                      {note.body ? <Text style={styles.noteBody}>{note.body}</Text> : null}
+                      <Text style={styles.noteDate}>Atualizada em {formatDateTime(note.updatedAt)}</Text>
+                    </View>
+                  )) : <View style={styles.emptyState}><View style={styles.emptyIcon}><Ionicons name="document-text-outline" size={24} color={colors.green} /></View><Text style={styles.emptyTitle}>Guarde uma ideia aqui.</Text><Text style={styles.emptyBody}>Suas notas ficam salvas só neste aparelho.</Text></View>}
+                </View>
+              )}
             </View>
           )}
 
-          {activeTab === 'biometrics' && (
+          {activeTab === 'security' && (
             <View style={styles.contentBlock}>
-              <View style={[styles.bioPanel, isCompactScreen && styles.bioPanelCompact]}>
-                <View style={[styles.bioIcon, bioState === 'success' && styles.bioIconSuccess]}><Ionicons name="finger-print" size={54} color={bioState === 'success' ? colors.white : colors.green} /></View>
-                <Text style={styles.bioTitle}>{bioState === 'success' ? 'Identidade confirmada' : 'Proteção do aparelho'}</Text>
-                <Text style={styles.bioBody}>{bioState === 'checking' ? 'Verificando os recursos de segurança...' : bioState === 'missing' ? 'Este aparelho não tem biometria configurada. Configure Face ID ou impressão digital nas definições do sistema.' : bioState === 'success' ? 'A autenticação foi concluída com sucesso.' : bioState === 'failed' ? 'A autenticação não foi concluída. Você pode tentar novamente.' : 'Use a biometria ou o código de acesso configurado no seu aparelho.'}</Text>
-                {bioState === 'checking' ? <ActivityIndicator color={colors.green} style={styles.actionLoader} /> : bioState === 'missing' ? (
-                  <View style={styles.noticeBox}><Ionicons name="information-circle-outline" size={19} color={colors.orange} /><Text style={styles.noticeText}>Disponibilidade depende do aparelho e da configuração local.</Text></View>
-                ) : <Pressable onPress={() => void authenticate()} style={styles.primaryButton} accessibilityRole="button"><Ionicons name="lock-open-outline" size={19} color={colors.white} /><Text style={styles.primaryButtonText}>{bioState === 'success' ? 'Autenticar novamente' : 'Confirmar com biometria'}</Text></Pressable>}
+              <View style={styles.securityCard}>
+                <View style={styles.securityIcon}><Ionicons name="finger-print-outline" size={28} color={colors.green} /></View>
+                <View style={styles.securityRow}>
+                  <View style={styles.securityCopy}>
+                    <Text style={styles.securityTitle}>Cadastro biométrico</Text>
+                    <Text style={styles.securityDescription}>
+                      {bioState === 'checking'
+                        ? 'Verificando os recursos do aparelho...'
+                        : bioState === 'missing'
+                          ? bioEnabled ? 'Cadastro mantido, mas a biometria está indisponível no aparelho.' : 'Biometria indisponível. Configure-a nas definições do aparelho.'
+                          : bioEnabled ? 'Ativado neste aparelho.' : 'Desativado.'}
+                    </Text>
+                  </View>
+                  {bioState === 'checking' || bioBusy ? <ActivityIndicator color={colors.green} /> : (
+                    <Switch
+                      value={bioEnabled}
+                      onValueChange={(enabled) => void setBiometricsEnabled(enabled)}
+                      disabled={bioState === 'missing' && !bioEnabled}
+                      trackColor={{ false: colors.line, true: colors.mint }}
+                      thumbColor={bioEnabled ? colors.green : colors.white}
+                      accessibilityLabel="Ativar ou desativar o cadastro biométrico"
+                      accessibilityState={{ checked: bioEnabled, disabled: bioState === 'missing' && !bioEnabled }}
+                    />
+                  )}
+                </View>
+                {bioMessage ? <Text style={styles.securityMessage} accessibilityRole="alert">{bioMessage}</Text> : null}
+                <Text style={styles.securityNote}>
+                  O login continua sendo feito com senha. Este cadastro não é solicitado após entrar no app; os dados biométricos permanecem no sistema do aparelho.
+                </Text>
               </View>
-              <View style={styles.infoLine}><Ionicons name="shield-checkmark-outline" size={18} color={colors.green} /><Text style={styles.infoLineText}>A verificação é feita pelo sistema do seu aparelho. O app não recebe seus dados biométricos.</Text></View>
+              <View style={styles.infoLine}><Ionicons name="shield-checkmark-outline" size={18} color={colors.green} /><Text style={styles.infoLineText}>O app guarda apenas o status e a data do cadastro, nunca sua impressão digital ou imagem facial.</Text></View>
             </View>
           )}
 
@@ -696,6 +1239,21 @@ export default function App() {
 
           {activeTab === 'camera' && (
             <View style={styles.contentBlock}>
+              <View style={styles.formCard}>
+                <Text style={styles.formTitle}>Associar foto a uma tarefa</Text>
+                <Text style={styles.emptyBody}>Opcional: escolha uma tarefa para encontrar a foto junto com ela.</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.choiceRow}>
+                  <Pressable onPress={() => setSelectedPhotoTaskId('')} style={[styles.choiceChip, !selectedPhotoTaskId && styles.choiceChipSelected]} accessibilityRole="button" accessibilityState={{ selected: !selectedPhotoTaskId }}>
+                    <Text style={[styles.choiceChipText, !selectedPhotoTaskId && styles.choiceChipTextSelected]}>Sem tarefa</Text>
+                  </Pressable>
+                  {tasks.map((task) => (
+                    <Pressable key={task.id} onPress={() => setSelectedPhotoTaskId(task.id)} style={[styles.choiceChip, selectedPhotoTaskId === task.id && styles.choiceChipSelected]} accessibilityRole="button" accessibilityState={{ selected: selectedPhotoTaskId === task.id }}>
+                      <Text style={[styles.choiceChipText, selectedPhotoTaskId === task.id && styles.choiceChipTextSelected]} numberOfLines={1}>{task.title}</Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
+                {photoTaskId ? <Text style={styles.taskMetaText}>Esta foto está vinculada a: {tasks.find((task) => task.id === photoTaskId)?.title ?? 'Tarefa removida'}</Text> : null}
+              </View>
               <View style={styles.cameraFrame}>
                 {photoUri ? <Image source={{ uri: photoUri }} style={styles.cameraPreview} resizeMode="cover" /> : cameraPermission?.granted ? <CameraView ref={cameraRef} style={styles.cameraPreview} facing="back" /> : (
                   <View style={styles.cameraEmpty}><View style={styles.cameraIcon}><Ionicons name="camera-outline" size={30} color={colors.green} /></View><Text style={styles.cameraEmptyTitle}>A câmera está pronta quando você estiver.</Text><Text style={styles.cameraEmptyBody}>A permissão será solicitada ao iniciar a captura.</Text></View>
@@ -703,7 +1261,7 @@ export default function App() {
                 {photoUri ? <View style={styles.photoBadge}><Ionicons name="checkmark-circle" size={15} color={colors.green} /><Text style={styles.photoBadgeText}>FOTO CAPTURADA</Text></View> : null}
               </View>
               <View style={styles.cameraActions}>{photoUri ? (
-                <Pressable onPress={() => setPhotoUri(null)} style={styles.secondaryButton} accessibilityRole="button"><Ionicons name="refresh-outline" size={19} color={colors.ink} /><Text style={styles.secondaryButtonText}>Tirar outra</Text></Pressable>
+                <Pressable onPress={() => { setPhotoUri(null); setPhotoTaskId(''); }} style={styles.secondaryButton} accessibilityRole="button"><Ionicons name="refresh-outline" size={19} color={colors.ink} /><Text style={styles.secondaryButtonText}>Tirar outra</Text></Pressable>
               ) : <Pressable onPress={() => void takePhoto()} disabled={cameraBusy} style={[styles.primaryButton, styles.cameraCaptureButton, cameraBusy && styles.buttonDisabled]} accessibilityRole="button">{cameraBusy ? <ActivityIndicator color={colors.white} /> : <Ionicons name="radio-button-on" size={20} color={colors.white} />}<Text style={styles.primaryButtonText}>{cameraBusy ? 'Capturando...' : 'Tirar foto'}</Text></Pressable>}</View>
               {cameraPermission && !cameraPermission.granted && !cameraPermission.canAskAgain ? <Text style={styles.errorMessage}>A câmera está bloqueada. Ative a permissão nas configurações do aparelho.</Text> : null}
             </View>
@@ -721,6 +1279,7 @@ export default function App() {
                         <View key={photo.id} style={styles.savedPhotoCard}>
                           <Image source={{ uri: photo.uri }} style={styles.savedPhotoPreview} resizeMode="cover" accessibilityLabel="Foto salva no aparelho" />
                           <Text style={styles.savedPhotoDate}>Data e hora: {formatDateTime(photo.savedAt)}</Text>
+                          {photo.taskId ? <Text style={styles.savedPhotoDate}>Tarefa: {tasks.find((task) => task.id === photo.taskId)?.title ?? 'Removida'}</Text> : null}
                         </View>
                       ))}
                     </View>
@@ -731,6 +1290,9 @@ export default function App() {
                     {tasks.map((task) => (
                       <View key={task.id} style={styles.savedRecord}>
                         <Text style={styles.savedRecordTitle}>Título: {task.title}</Text>
+                        <Text style={styles.savedRecordDetail}>Categoria: {task.category ?? 'Pessoal'} · Prioridade: {task.priority ?? 'Média'}</Text>
+                        {task.dueDate ? <Text style={styles.savedRecordDetail}>Prazo: {formatLocalDate(task.dueDate)}</Text> : null}
+                        {task.reminderTime ? <Text style={styles.savedRecordDetail}>Lembrete: {task.reminderTime}</Text> : null}
                         <Text style={styles.savedRecordDetail}>Data e hora: {formatDateTime(task.createdAt)}</Text>
                       </View>
                     ))}
@@ -753,14 +1315,24 @@ export default function App() {
                       </View>
                     ))}
                   </View>
+                ) : key === HABITS_KEY ? (
+                  <View key={key} style={styles.storageEntry}>
+                    <Text style={styles.storageKey}>Hábitos ({habits.length})</Text>
+                    {habits.map((habit) => <Text key={habit.id} style={styles.savedRecordDetail}>{habit.title} · {habit.completedDates.length} dias concluídos</Text>)}
+                  </View>
+                ) : key === NOTES_KEY ? (
+                  <View key={key} style={styles.storageEntry}>
+                    <Text style={styles.storageKey}>Notas ({notes.length})</Text>
+                    {notes.map((note) => <Text key={note.id} style={styles.savedRecordDetail}>{note.title}: {note.body || 'Sem conteúdo'}</Text>)}
+                  </View>
                 ) : (
                   <View key={key} style={styles.storageEntry}>
                     <Text style={styles.storageKey}>{key.replace(APP_STORAGE_PREFIX, '')}</Text>
                     <Text style={styles.storageValue} numberOfLines={6}>{(() => { try { return JSON.stringify(JSON.parse(value), null, 2); } catch { return value; } })()}</Text>
                   </View>
                 ))}</View>
-              ) : <View style={styles.emptyState}><View style={styles.emptyIcon}><Ionicons name="file-tray-outline" size={24} color={colors.green} /></View><Text style={styles.emptyTitle}>Nenhum dado salvo ainda.</Text><Text style={styles.emptyBody}>Tarefas, fotos e cadastros biométricos aparecerão aqui.</Text></View>}
-              <Pressable onPress={() => Alert.alert('Limpar dados do app?', 'Isso remove as tarefas, fotos, posições GPS e o registro biométrico salvos neste aparelho.', [{ text: 'Cancelar', style: 'cancel' }, { text: 'Limpar dados', style: 'destructive', onPress: () => void clearStorage() }])} disabled={!storedItems.length || storageBusy} style={[styles.clearButton, (!storedItems.length || storageBusy) && styles.clearButtonDisabled]} accessibilityRole="button"><Ionicons name="trash-outline" size={18} color={storedItems.length ? colors.red : colors.muted} /><Text style={[styles.clearButtonText, !storedItems.length && styles.clearButtonTextDisabled]}>Limpar dados do app</Text></Pressable>
+              ) : <View style={styles.emptyState}><View style={styles.emptyIcon}><Ionicons name="file-tray-outline" size={24} color={colors.green} /></View><Text style={styles.emptyTitle}>Nenhum dado salvo ainda.</Text><Text style={styles.emptyBody}>Tarefas, hábitos, notas, fotos e cadastros biométricos aparecerão aqui.</Text></View>}
+              <Pressable onPress={() => Alert.alert('Limpar dados do app?', 'Isso remove tarefas, hábitos, notas, fotos, posições GPS e o registro biométrico deste aparelho.', [{ text: 'Cancelar', style: 'cancel' }, { text: 'Limpar dados', style: 'destructive', onPress: () => void clearStorage() }])} disabled={!storedItems.length || storageBusy} style={[styles.clearButton, (!storedItems.length || storageBusy) && styles.clearButtonDisabled]} accessibilityRole="button"><Ionicons name="trash-outline" size={18} color={storedItems.length ? colors.red : colors.muted} /><Text style={[styles.clearButtonText, !storedItems.length && styles.clearButtonTextDisabled]}>Limpar dados do app</Text></Pressable>
               <Text style={styles.permissionFootnote}>Os dados ficam no armazenamento local deste aparelho.</Text>
             </View>
           )}
@@ -785,16 +1357,21 @@ const styles = StyleSheet.create({
   authCard: { width: '100%', maxWidth: 440, alignSelf: 'center', padding: 24, borderRadius: 20, borderWidth: 1, borderColor: colors.line, backgroundColor: colors.white, shadowColor: colors.ink, shadowOpacity: 0.06, shadowRadius: 18, shadowOffset: { width: 0, height: 8 }, elevation: 3 }, authCardCompact: { padding: 18 },
   authEyebrow: { color: colors.orange, fontSize: 9, fontWeight: '800', letterSpacing: 1.5, marginBottom: 8 }, authTitle: { color: colors.ink, fontFamily: 'Georgia', fontSize: 29, lineHeight: 36 }, authSubtitle: { color: colors.muted, fontSize: 13, lineHeight: 20, marginTop: 7 },
   authForm: { gap: 16, marginTop: 25 }, authField: { gap: 7 }, authLabel: { color: colors.ink, fontSize: 12, fontWeight: '700' }, authInputWrap: { minHeight: 52, flexDirection: 'row', alignItems: 'center', gap: 11, paddingHorizontal: 14, borderWidth: 1, borderColor: colors.line, borderRadius: 12, backgroundColor: colors.paper }, authInput: { flex: 1, minWidth: 0, height: 50, color: colors.ink, fontSize: 14 },
-  authPrimaryButton: { minHeight: 52, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9, paddingHorizontal: 16, borderRadius: 12, backgroundColor: colors.green }, authPrimaryText: { color: colors.white, fontSize: 14, fontWeight: '700' }, authSecondaryButton: { minHeight: 44, alignItems: 'center', justifyContent: 'center' }, authSecondaryText: { color: colors.muted, fontSize: 12, fontWeight: '600' },
-  authLinkButton: { minHeight: 38, alignItems: 'center', justifyContent: 'center' }, authLinkText: { color: colors.muted, fontSize: 12 }, authLinkStrong: { color: colors.green, fontWeight: '800' }, authError: { color: colors.red, fontSize: 12, lineHeight: 18 }, authBiometricIcon: { width: 104, height: 104, alignSelf: 'center', alignItems: 'center', justifyContent: 'center', borderRadius: 34, backgroundColor: colors.mint }, authBiometricCopy: { color: colors.muted, fontSize: 12, lineHeight: 19, textAlign: 'center' }, authFooter: { alignSelf: 'center', color: colors.muted, fontSize: 8, fontWeight: '800', letterSpacing: 1.1, textAlign: 'center', marginTop: 25 },
+  authPrimaryButton: { minHeight: 52, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9, paddingHorizontal: 16, borderRadius: 12, backgroundColor: colors.green }, authPrimaryText: { color: colors.white, fontSize: 14, fontWeight: '700' },
+  authLinkButton: { minHeight: 38, alignItems: 'center', justifyContent: 'center' }, authLinkText: { color: colors.muted, fontSize: 12 }, authLinkStrong: { color: colors.green, fontWeight: '800' }, authError: { color: colors.red, fontSize: 12, lineHeight: 18 }, authFooter: { alignSelf: 'center', color: colors.muted, fontSize: 8, fontWeight: '800', letterSpacing: 1.1, textAlign: 'center', marginTop: 25 },
   topBar: { minHeight: 70, paddingHorizontal: 22, flexDirection: 'row', alignItems: 'center', borderBottomWidth: 1, borderBottomColor: colors.line }, topBarCompact: { minHeight: 62, paddingHorizontal: 14 },
   brandMark: { width: 38, height: 38, borderRadius: 12, backgroundColor: colors.greenDark, alignItems: 'center', justifyContent: 'center' }, brandMarkText: { color: colors.white, fontFamily: 'Georgia', fontSize: 22, fontWeight: '700' }, brandTextWrap: { marginLeft: 10 }, brandName: { color: colors.ink, fontSize: 13, fontWeight: '800', letterSpacing: 1.2 }, brandCaption: { color: colors.muted, fontSize: 8, fontWeight: '700', letterSpacing: 1.2, marginTop: 3 },
   datePill: { marginLeft: 'auto', flexDirection: 'row', alignItems: 'center', gap: 7, borderWidth: 1, borderColor: colors.line, borderRadius: 20, paddingHorizontal: 10, paddingVertical: 7, backgroundColor: colors.white }, liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: colors.orange }, dateText: { color: colors.ink, fontSize: 11, fontWeight: '700', textTransform: 'uppercase' },
   scrollContent: { paddingHorizontal: 22, paddingTop: 24, paddingBottom: 28 }, scrollContentCompact: { paddingHorizontal: 16, paddingTop: 18, paddingBottom: 20 }, pageHeading: { marginBottom: 22 }, eyebrow: { color: colors.orange, fontSize: 10, fontWeight: '800', letterSpacing: 1.5, marginBottom: 9 }, pageTitle: { color: colors.ink, fontFamily: 'Georgia', fontSize: 32, lineHeight: 38 }, pageSubtitle: { color: colors.muted, fontSize: 13, lineHeight: 19, marginTop: 7 }, contentBlock: { gap: 16 },
+  organizerTabs: { gap: 8, paddingBottom: 2 }, organizerTab: { minHeight: 40, flexDirection: 'row', alignItems: 'center', gap: 7, paddingHorizontal: 13, borderRadius: 20, borderWidth: 1, borderColor: colors.line, backgroundColor: colors.white }, organizerTabSelected: { borderColor: colors.green, backgroundColor: colors.green }, organizerTabText: { color: colors.ink, fontSize: 12, fontWeight: '700' }, organizerTabTextSelected: { color: colors.white },
+  daySummary: { gap: 13, padding: 17, borderRadius: 15, backgroundColor: colors.white, borderWidth: 1, borderColor: colors.line }, daySummaryHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }, daySummaryTitle: { color: colors.ink, fontFamily: 'Georgia', fontSize: 20, marginTop: 5 }, daySummaryDetail: { color: colors.muted, fontSize: 11 }, textAction: { minHeight: 40, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }, textActionLabel: { color: colors.green, fontSize: 12, fontWeight: '700' }, todayHabits: { gap: 7, marginTop: 5 }, habitCheckRow: { minHeight: 50, flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 12, borderRadius: 11, backgroundColor: colors.white }, habitCheckTitle: { flex: 1, color: colors.ink, fontSize: 13 }, streakLabel: { color: colors.green, fontSize: 10, fontWeight: '700' },
+  formCard: { gap: 12, padding: 16, borderRadius: 15, backgroundColor: colors.white, borderWidth: 1, borderColor: colors.line }, formTitle: { color: colors.ink, fontFamily: 'Georgia', fontSize: 19 }, fieldLabel: { color: colors.muted, fontSize: 9, fontWeight: '800', letterSpacing: 1 }, choiceRow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 8 }, choiceChip: { minHeight: 34, justifyContent: 'center', paddingHorizontal: 12, borderRadius: 17, backgroundColor: colors.paper, borderWidth: 1, borderColor: colors.line }, choiceChipSelected: { borderColor: colors.green, backgroundColor: colors.green }, choiceChipText: { maxWidth: 190, color: colors.ink, fontSize: 11, fontWeight: '600' }, choiceChipTextSelected: { color: colors.white }, reminderRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 6 }, reminderCopy: { flex: 1, gap: 3 }, reminderTitle: { color: colors.ink, fontSize: 12, fontWeight: '700' }, reminderDescription: { color: colors.muted, fontSize: 10, lineHeight: 15 }, taskMessage: { color: colors.red, fontSize: 12, lineHeight: 18 },
+  taskCard: { gap: 10, padding: 13, borderRadius: 13, borderWidth: 1, borderColor: colors.line, backgroundColor: colors.white }, taskCardTop: { flexDirection: 'row', alignItems: 'center', gap: 10 }, taskMetaRow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 6, paddingLeft: 32 }, categoryPill: { color: colors.greenDark, fontSize: 9, fontWeight: '700', backgroundColor: colors.mint, borderRadius: 12, paddingHorizontal: 8, paddingVertical: 5 }, priorityPill: { color: colors.blue, fontSize: 9, fontWeight: '700', backgroundColor: '#E7EEF1', borderRadius: 12, paddingHorizontal: 8, paddingVertical: 5 }, priorityHigh: { color: colors.red, backgroundColor: '#F8E9E5' }, priorityLow: { color: colors.muted, backgroundColor: colors.paper }, taskMetaText: { color: colors.muted, fontSize: 10 }, attachPhotoButton: { minHeight: 34, flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', gap: 6, marginLeft: 29, paddingHorizontal: 8 }, attachPhotoText: { color: colors.green, fontSize: 11, fontWeight: '700' }, taskPhotoStrip: { gap: 8, paddingLeft: 32 }, taskPhotoPreview: { width: 64, height: 64, borderRadius: 9, backgroundColor: colors.paper },
+  habitCard: { minHeight: 72, flexDirection: 'row', alignItems: 'center', gap: 11, paddingHorizontal: 12, paddingVertical: 10, borderRadius: 12, backgroundColor: colors.white, borderWidth: 1, borderColor: colors.line }, habitCheckButton: { width: 24, height: 24, borderRadius: 8, borderWidth: 1.5, borderColor: '#B6C5B9', alignItems: 'center', justifyContent: 'center' }, habitCopy: { flex: 1, gap: 4 }, habitTitle: { color: colors.ink, fontSize: 13, fontWeight: '700' }, habitDetail: { color: colors.muted, fontSize: 10 }, noteInput: { minHeight: 100, paddingTop: 13 }, noteCard: { gap: 10, padding: 14, borderRadius: 13, backgroundColor: colors.white, borderWidth: 1, borderColor: colors.line }, noteHeader: { flexDirection: 'row', alignItems: 'center', gap: 8 }, noteTitleWrap: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 8 }, noteTitle: { flex: 1, color: colors.ink, fontSize: 13, fontWeight: '700' }, noteBody: { color: colors.ink, fontSize: 12, lineHeight: 19 }, noteDate: { color: colors.muted, fontSize: 9 },
   summaryRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }, summaryCopy: { gap: 5 }, summaryLabel: { color: colors.muted, fontSize: 9, fontWeight: '800', letterSpacing: 1.1 }, summaryTitle: { color: colors.ink, fontSize: 15, fontWeight: '700' }, progressRing: { width: 48, height: 48, borderRadius: 24, borderWidth: 2, borderColor: colors.green, alignItems: 'center', justifyContent: 'center' }, progressNumber: { color: colors.green, fontSize: 12, fontWeight: '800' }, progressTrack: { height: 5, backgroundColor: colors.line, borderRadius: 4, overflow: 'hidden' }, progressFill: { height: 5, borderRadius: 4, backgroundColor: colors.green },
   inputRow: { flexDirection: 'row', gap: 9 }, taskInput: { flex: 1, minHeight: 50, borderRadius: 12, borderWidth: 1, borderColor: colors.line, backgroundColor: colors.white, paddingHorizontal: 15, color: colors.ink, fontSize: 14 }, addButton: { width: 50, height: 50, borderRadius: 12, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.green }, listHeader: { marginTop: 5, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }, sectionTitle: { color: colors.ink, fontFamily: 'Georgia', fontSize: 21 }, countLabel: { color: colors.muted, fontSize: 9, letterSpacing: 1, fontWeight: '800' },
   taskRow: { minHeight: 58, flexDirection: 'row', alignItems: 'center', borderBottomWidth: 1, borderBottomColor: colors.line, gap: 12 }, checkButton: { width: 22, height: 22, borderRadius: 7, borderWidth: 1.5, borderColor: '#B6C5B9', alignItems: 'center', justifyContent: 'center' }, checkButtonDone: { borderColor: colors.green, backgroundColor: colors.green }, taskTitle: { flex: 1, color: colors.ink, fontSize: 14 }, taskTitleDone: { color: colors.muted, textDecorationLine: 'line-through' }, removeButton: { width: 32, height: 36, alignItems: 'center', justifyContent: 'center' }, emptyState: { alignItems: 'center', paddingVertical: 30, paddingHorizontal: 18, backgroundColor: colors.white, borderWidth: 1, borderColor: colors.line, borderRadius: 14 }, emptyIcon: { width: 46, height: 46, borderRadius: 16, backgroundColor: colors.mint, alignItems: 'center', justifyContent: 'center', marginBottom: 13 }, emptyTitle: { color: colors.ink, fontSize: 14, fontWeight: '700' }, emptyBody: { color: colors.muted, fontSize: 12, textAlign: 'center', marginTop: 6, lineHeight: 18 }, loader: { paddingVertical: 22 },
-  bioPanel: { alignItems: 'center', padding: 22, borderRadius: 16, borderWidth: 1, borderColor: colors.line, backgroundColor: colors.white }, bioPanelCompact: { padding: 16 }, bioIcon: { width: 106, height: 106, borderRadius: 36, backgroundColor: colors.mint, alignItems: 'center', justifyContent: 'center', marginBottom: 17 }, bioIconSuccess: { backgroundColor: colors.green }, bioTitle: { color: colors.ink, fontFamily: 'Georgia', fontSize: 21, textAlign: 'center' }, bioBody: { color: colors.muted, fontSize: 13, lineHeight: 20, textAlign: 'center', marginTop: 8, marginBottom: 18 }, primaryButton: { minHeight: 50, width: '100%', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9, paddingHorizontal: 16, borderRadius: 12, backgroundColor: colors.green }, primaryButtonText: { color: colors.white, fontSize: 13, fontWeight: '700', flexShrink: 1, textAlign: 'center' }, actionLoader: { marginVertical: 15 }, noticeBox: { width: '100%', flexDirection: 'row', gap: 8, alignItems: 'center', backgroundColor: colors.orangeLight, borderRadius: 10, padding: 11 }, noticeText: { flex: 1, color: colors.ink, fontSize: 11, lineHeight: 16 }, infoLine: { flexDirection: 'row', gap: 9, alignItems: 'flex-start', paddingHorizontal: 4 }, infoLineText: { flex: 1, color: colors.muted, fontSize: 11, lineHeight: 17 },
+  securityCard: { padding: 18, borderRadius: 16, borderWidth: 1, borderColor: colors.line, backgroundColor: colors.white }, securityIcon: { width: 54, height: 54, borderRadius: 18, backgroundColor: colors.mint, alignItems: 'center', justifyContent: 'center', marginBottom: 16 }, securityRow: { flexDirection: 'row', alignItems: 'center', gap: 12 }, securityCopy: { flex: 1, gap: 5 }, securityTitle: { color: colors.ink, fontSize: 15, fontWeight: '700' }, securityDescription: { color: colors.muted, fontSize: 12, lineHeight: 18 }, securityMessage: { color: colors.red, fontSize: 12, lineHeight: 18, marginTop: 12 }, securityNote: { color: colors.muted, fontSize: 12, lineHeight: 18, marginTop: 16, paddingTop: 14, borderTopWidth: 1, borderTopColor: colors.line }, primaryButton: { minHeight: 50, width: '100%', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9, paddingHorizontal: 16, borderRadius: 12, backgroundColor: colors.green }, primaryButtonText: { color: colors.white, fontSize: 13, fontWeight: '700', flexShrink: 1, textAlign: 'center' }, infoLine: { flexDirection: 'row', gap: 9, alignItems: 'flex-start', paddingHorizontal: 4 }, infoLineText: { flex: 1, color: colors.muted, fontSize: 11, lineHeight: 17 },
   mapFrame: { width: '100%', height: 300, borderRadius: 15, overflow: 'hidden', borderWidth: 1, borderColor: colors.line, backgroundColor: '#E6EDE7' }, mapFrameCompact: { height: 250 }, map: { flex: 1 }, mapLoading: { ...StyleSheet.absoluteFill, alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: colors.paper }, mapLoadingText: { color: colors.muted, fontSize: 12 }, mapAttribution: { alignSelf: 'flex-start', marginTop: -8 }, mapAttributionText: { color: colors.green, fontSize: 10, textDecorationLine: 'underline' }, settingsButton: { alignSelf: 'center', paddingVertical: 8 }, settingsButtonText: { color: colors.green, fontSize: 12, fontWeight: '700', textDecorationLine: 'underline' }, coordinateRow: { flexDirection: 'row', alignItems: 'center', gap: 13, padding: 15, borderRadius: 12, borderWidth: 1, borderColor: colors.line, backgroundColor: colors.white }, coordinateValue: { color: colors.ink, fontSize: 12, fontWeight: '700', marginTop: 5 }, coordinateDivider: { width: 1, height: 31, backgroundColor: colors.line }, accuracyBadge: { marginLeft: 'auto', backgroundColor: colors.mint, paddingHorizontal: 8, paddingVertical: 6, borderRadius: 8 }, accuracyText: { color: colors.greenDark, fontSize: 10, fontWeight: '700' }, permissionFootnote: { color: colors.muted, fontSize: 10, lineHeight: 15, textAlign: 'center', paddingHorizontal: 10 }, errorMessage: { color: colors.red, fontSize: 12, lineHeight: 18 }, buttonDisabled: { opacity: 0.7 },
   cameraFrame: { height: 370, width: '100%', borderRadius: 15, overflow: 'hidden', backgroundColor: '#E5EAE5', borderWidth: 1, borderColor: colors.line }, cameraPreview: { width: '100%', height: '100%' }, cameraEmpty: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 25 }, cameraIcon: { width: 62, height: 62, borderRadius: 20, backgroundColor: colors.white, alignItems: 'center', justifyContent: 'center', marginBottom: 15 }, cameraEmptyTitle: { color: colors.ink, fontFamily: 'Georgia', fontSize: 18, lineHeight: 24, textAlign: 'center' }, cameraEmptyBody: { color: colors.muted, fontSize: 12, lineHeight: 18, textAlign: 'center', marginTop: 7 }, photoBadge: { position: 'absolute', left: 12, top: 12, flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: colors.white, borderRadius: 20, paddingHorizontal: 9, paddingVertical: 6 }, photoBadgeText: { color: colors.greenDark, fontSize: 9, fontWeight: '800', letterSpacing: 0.5 }, cameraActions: { alignItems: 'center' }, cameraCaptureButton: { maxWidth: 260 }, secondaryButton: { minHeight: 48, paddingHorizontal: 19, borderRadius: 12, borderWidth: 1, borderColor: colors.line, backgroundColor: colors.white, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }, secondaryButtonText: { color: colors.ink, fontSize: 13, fontWeight: '700' },
   storageSummary: { minHeight: 82, flexDirection: 'row', alignItems: 'center', padding: 14, borderRadius: 14, borderWidth: 1, borderColor: colors.line, backgroundColor: colors.white, gap: 12 }, storageIcon: { width: 47, height: 47, borderRadius: 15, backgroundColor: colors.mint, alignItems: 'center', justifyContent: 'center' }, storageSummaryText: { flex: 1, gap: 4 }, storageCount: { color: colors.ink, fontSize: 19, fontWeight: '800' }, storageCountUnit: { color: colors.muted, fontSize: 11, fontWeight: '500' }, iconButton: { width: 38, height: 38, borderRadius: 11, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.paper }, storageList: { borderTopWidth: 1, borderTopColor: colors.line }, storageEntry: { paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: colors.line, gap: 7 }, storageKey: { color: colors.green, fontSize: 11, fontWeight: '800' }, storageValue: { color: colors.ink, fontSize: 11, lineHeight: 16, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' }, savedRecord: { gap: 4, paddingVertical: 9, paddingHorizontal: 11, borderRadius: 10, backgroundColor: colors.paper }, savedRecordTitle: { color: colors.ink, fontSize: 12, fontWeight: '600', flexShrink: 1 }, savedRecordDetail: { color: colors.muted, fontSize: 11, lineHeight: 16 }, photoGallery: { flexDirection: 'row', flexWrap: 'wrap', gap: 12 }, savedPhotoCard: { width: 104, maxWidth: '100%', flexGrow: 1, flexBasis: 90, gap: 5 }, savedPhotoPreview: { width: '100%', aspectRatio: 1, borderRadius: 10, backgroundColor: colors.paper }, savedPhotoDate: { color: colors.muted, fontSize: 9, lineHeight: 14 }, clearButton: { minHeight: 46, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, borderWidth: 1, borderColor: '#E8C7C1', borderRadius: 11, backgroundColor: colors.white }, clearButtonDisabled: { borderColor: colors.line }, clearButtonText: { color: colors.red, fontSize: 12, fontWeight: '700', flexShrink: 1 }, clearButtonTextDisabled: { color: colors.muted }, footer: { alignItems: 'center', marginTop: 34, gap: 11 }, footerRule: { width: 38, height: 2, backgroundColor: colors.orange, borderRadius: 2 }, footerText: { color: colors.muted, fontSize: 8, fontWeight: '800', letterSpacing: 1.2 }, footerDot: { color: colors.orange },
