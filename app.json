@@ -7,9 +7,27 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "plugins": [
-      ["expo-camera", { "cameraPermission": "Permitir que o Aplicativo Alfa use a câmera para tirar fotos.", "microphonePermission": "Permitir que o Aplicativo Alfa use o microfone ao gravar vídeos.", "recordAudioAndroid": false }],
-      ["expo-location", { "locationWhenInUsePermission": "Permitir que o Aplicativo Alfa mostre sua posição no mapa." }],
-      ["expo-local-authentication", { "faceIDPermission": "Permitir que o Aplicativo Alfa use o Face ID para confirmar sua identidade." }]
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Permitir que o Aplicativo Alfa use a câmera para tirar fotos.",
+          "microphonePermission": "Permitir que o Aplicativo Alfa use o microfone ao gravar vídeos.",
+          "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Permitir que o Aplicativo Alfa mostre sua posição no mapa."
+        }
+      ],
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Permitir que o Aplicativo Alfa use o Face ID para confirmar sua identidade."
+        }
+      ],
+      "expo-font"
     ],
     "ios": {
       "supportsTablet": true
